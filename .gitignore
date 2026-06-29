@@ -1,0 +1,17 @@
+# Secrets — never commit these
+.env
+
+# Pyrogram/Kurigram session files
+*.session
+*.session-journal
+
+# Working data
+data/
+downloads/
+*.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
