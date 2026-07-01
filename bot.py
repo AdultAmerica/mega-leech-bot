@@ -108,10 +108,25 @@ def _media_type(path):
     return "document"
 
 
+async def _send_media(chat_id, path, media, thread_id, progress):
+    kwargs = dict(chat_id=chat_id, message_thread_id=thread_id or None, progress=progress)
+    try:
+        if media == "video":
+            return await app.send_video(video=path, supports_streaming=True, file_name=os.path.basename(path), **kwargs)
+        elif media == "photo":
+            return await app.send_photo(photo=path, **kwargs)
+        elif media == "audio":
+            return await app.send_audio(audio=path, file_name=os.path.basename(path), **kwargs)
+    except Exception as e:
+        print(f"Media send as {media} failed ({e}), falling back to document")
+    return await app.send_document(document=path, file_name=os.path.basename(path), **kwargs)
+
+
 async def _upload_and_fanout(path, chats, status_msg):
     name = os.path.basename(path)
     throttle = utils.ProgressThrottle()
     media = _media_type(path)
+    print(f"Uploading {name} as {media}")
 
     async def _progress(current, total):
         if throttle.should_edit(current, total):
@@ -125,35 +140,7 @@ async def _upload_and_fanout(path, chats, status_msg):
     sent = None
     while True:
         try:
-            if media == "video":
-                sent = await app.send_video(
-                    chat_id=first["chat_id"],
-                    video=path,
-                    message_thread_id=first["thread_id"] or None,
-                    progress=_progress,
-                    supports_streaming=True,
-                )
-            elif media == "photo":
-                sent = await app.send_photo(
-                    chat_id=first["chat_id"],
-                    photo=path,
-                    message_thread_id=first["thread_id"] or None,
-                    progress=_progress,
-                )
-            elif media == "audio":
-                sent = await app.send_audio(
-                    chat_id=first["chat_id"],
-                    audio=path,
-                    message_thread_id=first["thread_id"] or None,
-                    progress=_progress,
-                )
-            else:
-                sent = await app.send_document(
-                    chat_id=first["chat_id"],
-                    document=path,
-                    message_thread_id=first["thread_id"] or None,
-                    progress=_progress,
-                )
+            sent = await _send_media(first["chat_id"], path, media, first["thread_id"], _progress)
             break
         except FloodWait as e:
             await _safe_edit(status_msg, f"Rate limited, waiting {e.value}s...")
