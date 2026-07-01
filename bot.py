@@ -345,4 +345,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.loop.run_until_complete(main())
