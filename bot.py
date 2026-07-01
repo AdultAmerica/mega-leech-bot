@@ -92,9 +92,26 @@ async def _safe_edit(message, text):
 # ----------------------------------------------------------------------
 # Upload one file, then fan it out to the other chats with no re-upload
 # ----------------------------------------------------------------------
+_VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v"}
+_PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+_AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".wav", ".m4a", ".aac", ".opus", ".wma"}
+
+
+def _media_type(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _VIDEO_EXTS:
+        return "video"
+    if ext in _PHOTO_EXTS:
+        return "photo"
+    if ext in _AUDIO_EXTS:
+        return "audio"
+    return "document"
+
+
 async def _upload_and_fanout(path, chats, status_msg):
     name = os.path.basename(path)
     throttle = utils.ProgressThrottle()
+    media = _media_type(path)
 
     async def _progress(current, total):
         if throttle.should_edit(current, total):
@@ -108,35 +125,55 @@ async def _upload_and_fanout(path, chats, status_msg):
     sent = None
     while True:
         try:
-            sent = await app.send_document(
-                chat_id=first["chat_id"],
-                document=path,
-                message_thread_id=first["thread_id"] or None,
-                progress=_progress,
-            )
+            if media == "video":
+                sent = await app.send_video(
+                    chat_id=first["chat_id"],
+                    video=path,
+                    message_thread_id=first["thread_id"] or None,
+                    progress=_progress,
+                    supports_streaming=True,
+                )
+            elif media == "photo":
+                sent = await app.send_photo(
+                    chat_id=first["chat_id"],
+                    photo=path,
+                    message_thread_id=first["thread_id"] or None,
+                    progress=_progress,
+                )
+            elif media == "audio":
+                sent = await app.send_audio(
+                    chat_id=first["chat_id"],
+                    audio=path,
+                    message_thread_id=first["thread_id"] or None,
+                    progress=_progress,
+                )
+            else:
+                sent = await app.send_document(
+                    chat_id=first["chat_id"],
+                    document=path,
+                    message_thread_id=first["thread_id"] or None,
+                    progress=_progress,
+                )
             break
         except FloodWait as e:
             await _safe_edit(status_msg, f"Rate limited, waiting {e.value}s...")
             await asyncio.sleep(e.value)
 
-    file_id = sent.document.file_id if sent and sent.document else None
-    if file_id is None:
+    if sent is None:
         return
 
-    # Copy to the remaining chats by file id (Telegram already has the bytes).
     for chat in chats[1:]:
         while True:
             try:
-                await app.send_document(
+                await sent.copy(
                     chat_id=chat["chat_id"],
-                    document=file_id,
                     message_thread_id=chat["thread_id"] or None,
                 )
                 break
             except FloodWait as e:
                 await asyncio.sleep(e.value)
             except Exception:
-                break  # a single bad destination must not stop the whole job
+                break
 
 
 # ----------------------------------------------------------------------
