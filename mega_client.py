@@ -98,32 +98,16 @@ async def list_folder(link: str):
     return files
 
 
-async def download_file(link: str, rel_path: str, dest_dir: str) -> str:
+async def download_folder(link: str, dest_dir: str) -> None:
     """
-    Download a single file (addressed by its path inside the public folder
-    link) into dest_dir, and return the local file path.
+    Download an entire MEGA public folder into dest_dir.
 
-    The folder-link-plus-subpath form is what MEGAcmd accepts, e.g.:
-        mega-get "https://mega.nz/folder/XXX#KEY/subdir/movie.mkv" /data/downloads
-
-    MEGAcmd resumes partially downloaded files on its own, which is why a
-    restart mid-download is not fatal.
+    MEGAcmd does not support downloading individual files from a public
+    folder link by appending filenames — only the /file/FILEID form works,
+    and we don't have those IDs.  Downloading the whole folder is the
+    reliable approach.
     """
     os.makedirs(dest_dir, exist_ok=True)
-    remote = f"{link.rstrip('/')}/{rel_path}"
-    # No timeout: large files can legitimately take a long time.
-    code, out, err = await _run(["mega-get", remote, dest_dir], timeout=None)
+    code, out, err = await _run(["mega-get", link, dest_dir], timeout=None)
     if code != 0:
-        raise RuntimeError(
-            f"mega-get failed for {rel_path}: {err.strip() or out.strip()}"
-        )
-
-    basename = os.path.basename(rel_path)
-    direct = os.path.join(dest_dir, basename)
-    if os.path.exists(direct):
-        return direct
-    # MEGAcmd may recreate the subfolder structure under dest_dir; find the file.
-    for root, _dirs, names in os.walk(dest_dir):
-        if basename in names:
-            return os.path.join(root, basename)
-    raise RuntimeError(f"Downloaded file not found for {rel_path}")
+        raise RuntimeError(f"mega-get failed: {err.strip() or out.strip()}")

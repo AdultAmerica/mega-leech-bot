@@ -22,6 +22,7 @@ How it works:
 """
 import asyncio
 import os
+import shutil
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -82,6 +83,17 @@ def _owner_only(_, __, message):
 OWNER = filters.create(_owner_only)
 
 
+def _extract_mega_url(message):
+    """Find the first MEGA URL among the command arguments.
+
+    Handles the common mistake of typing the command name twice, e.g.
+    ``/leech /leech https://mega.nz/...``."""
+    for arg in message.command[1:]:
+        if arg.startswith("http"):
+            return arg
+    return None
+
+
 async def _safe_edit(message, text):
     try:
         await message.edit_text(text)
@@ -140,30 +152,28 @@ async def _upload_and_fanout(path, chats, status_msg):
 
 
 # ----------------------------------------------------------------------
-# Process one file end to end: download -> (split) -> upload -> clean up
+# Process one already-downloaded local file: (split) -> upload -> clean up
 # ----------------------------------------------------------------------
-async def _process_file(link, rel_path, dest_dir, chats, status_msg, job_id):
-    await _safe_edit(status_msg, f"Downloading `{rel_path}` from MEGA...")
-    local = await mega_client.download_file(link, rel_path, dest_dir)
-    size = os.path.getsize(local)
+async def _process_file(local_path, rel_path, chats, status_msg, job_id):
+    size = os.path.getsize(local_path)
 
     try:
         if size > config.MAX_PART_SIZE:
             await _safe_edit(
                 status_msg, f"`{rel_path}` is {utils.human(size)} — splitting..."
             )
-            for part in utils.split_file(local):
+            for part in utils.split_file(local_path):
                 await _upload_and_fanout(part, chats, status_msg)
                 try:
                     os.remove(part)
                 except OSError:
                     pass
         else:
-            await _upload_and_fanout(local, chats, status_msg)
+            await _upload_and_fanout(local_path, chats, status_msg)
     finally:
-        if os.path.exists(local):
+        if os.path.exists(local_path):
             try:
-                os.remove(local)
+                os.remove(local_path)
             except OSError:
                 pass
 
@@ -179,15 +189,29 @@ async def run_leech(link, status_msg, requested_by, job_id=None):
         db.create_job(job_id, link, requested_by)
 
     _cancel.clear()
+    job_dir = os.path.join(config.DOWNLOAD_DIR, job_id)
     try:
         await mega_client.login()
 
-        await _safe_edit(status_msg, "Listing folder contents...")
-        files = await mega_client.list_folder(link)
+        # Download the entire folder at once — MEGAcmd cannot fetch
+        # individual files from a public folder link by filename.
+        await _safe_edit(status_msg, "Downloading folder from MEGA…")
+        if os.path.exists(job_dir):
+            shutil.rmtree(job_dir, ignore_errors=True)
+        await mega_client.download_folder(link, job_dir)
+
+        # Walk the local directory to find all downloaded files.
+        files = []
+        for root, _dirs, names in os.walk(job_dir):
+            for name in sorted(names):
+                local_path = os.path.join(root, name)
+                rel_path = os.path.relpath(local_path, job_dir)
+                files.append((rel_path, local_path))
+
         if not files:
             await _safe_edit(
                 status_msg,
-                "No files found. Run `/probe <link>` so I can check the raw listing.",
+                "No files found. Run `/probe <link>` to check the folder.",
             )
             db.set_job_status(job_id, "error")
             return
@@ -203,17 +227,17 @@ async def run_leech(link, status_msg, requested_by, job_id=None):
             return
 
         total = len(files)
-        for index, rel_path in enumerate(files, start=1):
+        for index, (rel_path, local_path) in enumerate(files, start=1):
             if _cancel.is_set():
                 await _safe_edit(status_msg, "Cancelled.")
                 db.set_job_status(job_id, "cancelled")
                 return
             if db.is_file_done(job_id, rel_path):
                 continue
-            await _safe_edit(status_msg, f"[{index}/{total}] {rel_path}")
+            await _safe_edit(status_msg, f"[{index}/{total}] Uploading `{rel_path}`")
             try:
                 await _process_file(
-                    link, rel_path, config.DOWNLOAD_DIR, chats, status_msg, job_id
+                    local_path, rel_path, chats, status_msg, job_id
                 )
             except Exception as e:
                 await app.send_message(requested_by, f"Failed on `{rel_path}`: {e}")
@@ -225,6 +249,8 @@ async def run_leech(link, status_msg, requested_by, job_id=None):
     except Exception as e:
         db.set_job_status(job_id, "error")
         await _safe_edit(status_msg, f"Job failed: {e}")
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 # ----------------------------------------------------------------------
@@ -258,10 +284,10 @@ async def chats_cmd(_, message):
 
 @app.on_message(filters.command("probe") & OWNER)
 async def probe_cmd(_, message):
-    if len(message.command) < 2:
+    link = _extract_mega_url(message)
+    if not link:
         await message.reply_text("Usage: `/probe <mega folder url>`")
         return
-    link = message.command[1]
     msg = await message.reply_text("Running mega-ls...")
     try:
         await mega_client.login()
@@ -284,13 +310,13 @@ async def cancel_cmd(_, message):
 
 @app.on_message(filters.command("leech") & OWNER)
 async def leech_cmd(_, message):
-    if len(message.command) < 2:
+    link = _extract_mega_url(message)
+    if not link:
         await message.reply_text("Usage: `/leech <mega folder url>`")
         return
     if _busy.locked():
         await message.reply_text("A job is already running. Use /cancel first.")
         return
-    link = message.command[1]
     status = await message.reply_text("Starting...")
     async with _busy:
         await run_leech(link, status, message.from_user.id)
