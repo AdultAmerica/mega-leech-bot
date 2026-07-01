@@ -2,10 +2,5 @@
 # It supports forum Topics and recent Telegram API changes.
 kurigram
 
-# Speeds up MTProto encryption (matters for large uploads).
-# If the Docker build ever fails on this line, you can safely remove it —
-# the bot still works, just a little slower.
-tgcrypto
-
 # Loads the .env file during local development.
 python-dotenv

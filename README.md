@@ -1,7 +1,7 @@
 # MEGA → Telegram Leech Bot
 
 Downloads a MEGA folder and uploads every file to all Telegram groups and
-channels the bot has been added to. Built to run on Railway.
+channels the bot has been added to. Built to run on a Hetzner VPS via Docker.
 
 ## What it does
 
@@ -10,14 +10,14 @@ channels the bot has been added to. Built to run on Railway.
   No hardcoded chat list.
 - **Uploads once, fans out by file id.** A file is uploaded a single time and
   then copied to every other chat without re-uploading, so you pay upload
-  bandwidth (Railway egress) only once.
+  bandwidth only once.
 - **Handles big files.** Anything over ~2 GB is split into parts automatically
   (Telegram's bot upload limit).
 - **Streams one file at a time.** It never needs disk for the whole folder —
   only for the largest single file — so a 400 GB folder needs the same small
   volume as a tiny one.
-- **Resumes after restarts.** Progress is saved in SQLite; if Railway restarts
-  mid-job, the bot continues from the next unfinished file.
+- **Resumes after restarts.** Progress is saved in SQLite; if the container
+  restarts mid-job, the bot continues from the next unfinished file.
 - **Owner-only.** Only your Telegram user id can issue commands.
 
 ## You will need
@@ -39,21 +39,44 @@ channels the bot has been added to. Built to run on Railway.
 | `/cancel` | stop after the current file |
 | `/start`, `/help` | show help |
 
-## Deploy on Railway
+## Deploy on a Hetzner VPS
 
-1. Push this folder to a GitHub repository.
-2. On [Railway](https://railway.app): **New Project → Deploy from GitHub repo**,
-   and pick the repo. Railway will detect the `Dockerfile` automatically.
-3. Open the service → **Variables**, and add every name from `.env.example`
-   with your real values (do **not** add `DATA_DIR` yet).
-4. Open **Settings → Volumes → New Volume**, and set the mount path to `/data`.
-   Then add a variable `DATA_DIR=/data`. The volume gives you persistent disk
-   for downloads and lets jobs resume after a restart.
-   - Size it to **your largest single file + ~4 GB** (e.g. 20 GB is plenty
-     unless you have very large individual files).
-5. **Deploy.** Watch the build logs — the one step that occasionally needs a
-   tweak is the MEGAcmd download in the `Dockerfile` (see the comment there).
-6. When the deploy logs show `Bot @yourbot started.`, message your bot `/start`.
+1. SSH into your Hetzner VPS and install Docker (`curl -fsSL https://get.docker.com | sh`)
+   if it isn't already installed.
+2. Clone this repository onto the VPS:
+   ```bash
+   git clone <this-repo-url>
+   cd mega-leech-bot
+   ```
+3. Copy `.env.example` to `.env` and fill in your real values:
+   ```bash
+   cp .env.example .env
+   ```
+   Set `DATA_DIR=/data` — this path is inside the container and gets mapped to
+   a persistent folder on the VPS in the next step.
+4. Create a folder on the VPS for persistent storage and build the image:
+   ```bash
+   mkdir -p /opt/mega-leech-bot/data
+   docker build -t mega-leech-bot .
+   ```
+   - Size the disk to **your largest single file + ~4 GB** (e.g. 20 GB is
+     plenty unless you have very large individual files).
+5. Run the container, mounting the data folder and restarting automatically
+   on reboot or crash:
+   ```bash
+   docker run -d --name mega-leech-bot \
+     --env-file .env \
+     -v /opt/mega-leech-bot/data:/data \
+     --restart unless-stopped \
+     mega-leech-bot
+   ```
+6. Watch the logs with `docker logs -f mega-leech-bot`. The one step that
+   occasionally needs a tweak is the MEGAcmd download in the `Dockerfile`
+   (see the comment there). When the logs show `Bot @yourbot started.`,
+   message your bot `/start`.
+
+To ship a code update later: `git pull`, `docker build -t mega-leech-bot .`,
+then `docker rm -f mega-leech-bot` and re-run the `docker run` command above.
 
 ## First run — validate small
 
@@ -74,12 +97,12 @@ cp .env.example .env                      # then edit .env with real values
 python bot.py
 ```
 
-## Cost note (Railway)
+## Cost note
 
-Railway meters egress (~$0.05/GB). Because files are uploaded once and copied,
-egress ≈ the folder size — roughly $10–20 for a 200–400 GB run, regardless of
-how many chats you dump to. Railway has no hard spending cap, so set a usage
-alert in your account if you want a safety net.
+A Hetzner VPS is billed at a flat monthly rate rather than metered egress, so
+a leech run's bandwidth doesn't add extra cost the way it would on a
+pay-per-GB host — just make sure the VPS plan's included traffic covers the
+folder sizes you expect to dump.
 
 ## Files
 
@@ -91,4 +114,3 @@ alert in your account if you want a safety net.
 | `utils.py` | sizes, progress throttle, file splitter |
 | `config.py` | loads settings from environment variables |
 | `Dockerfile` | installs MEGAcmd + Python deps |
-| `railway.json` | tells Railway to use the Dockerfile |
