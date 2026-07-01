@@ -4,6 +4,8 @@ services:
     container_name: mega-leech-bot
     restart: unless-stopped
     env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
     volumes:
       - bot-data:/data
 
