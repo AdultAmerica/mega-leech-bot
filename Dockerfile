@@ -2,7 +2,7 @@
 FROM python:3.12-slim-bookworm
 
 # --- Install MEGAcmd from MEGA's official Debian package ---------------------
-# If the Railway build fails on this step, the most likely cause is the .deb
+# If the build fails on this step, the most likely cause is the .deb
 # URL below: open https://mega.nz/cmd , find the "Debian 12" download link, and
 # replace the URL with the current one. Everything else can stay the same.
 RUN apt-get update \

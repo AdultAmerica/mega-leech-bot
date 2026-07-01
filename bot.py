@@ -14,11 +14,11 @@ How it works:
     group or channel it records that chat; when it is removed it stops dumping
     there. (You can list them with /chats.)
   - Each file is uploaded ONCE to the first chat and then copied to the other
-    chats by file id, so upload bandwidth (Railway egress) is paid a single
-    time no matter how many chats you dump to.
+    chats by file id, so upload bandwidth is paid a single time no matter how
+    many chats you dump to.
   - Files larger than ~2 GB are split into parts automatically.
-  - Progress is saved in SQLite, so if Railway restarts mid-job the bot resumes
-    where it left off instead of starting over.
+  - Progress is saved in SQLite, so if the container restarts mid-job the bot
+    resumes where it left off instead of starting over.
 """
 import asyncio
 import os
@@ -56,7 +56,7 @@ ACTIVE_STATUSES = {
 
 
 # ----------------------------------------------------------------------
-# Health-check web server (so Railway sees an open port and stays happy)
+# Health-check web server (lets an external monitor confirm the bot is up)
 # ----------------------------------------------------------------------
 def _start_health_server():
     class Handler(BaseHTTPRequestHandler):
