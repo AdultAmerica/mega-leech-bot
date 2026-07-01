@@ -1,0 +1,13 @@
+services:
+  leech-bot:
+    build: .
+    container_name: mega-leech-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - bot-data:/data
+    ports:
+      - "8080:8080"
+
+volumes:
+  bot-data:
