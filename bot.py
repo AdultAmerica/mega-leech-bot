@@ -108,11 +108,43 @@ def _media_type(path):
     return "document"
 
 
+import json
+import subprocess
+
+
+def _video_meta(path):
+    """Extract width, height, duration from a video file using ffprobe."""
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_streams", "-select_streams", "v:0", path,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = json.loads(r.stdout)
+        s = info["streams"][0]
+        return {
+            "width": int(s.get("width", 0)) or None,
+            "height": int(s.get("height", 0)) or None,
+            "duration": int(float(s.get("duration", 0))) or None,
+        }
+    except Exception:
+        return {}
+
+
 async def _send_media(chat_id, path, media, thread_id, progress):
     kwargs = dict(chat_id=chat_id, message_thread_id=thread_id or None, progress=progress)
     try:
         if media == "video":
-            return await app.send_video(video=path, supports_streaming=True, file_name=os.path.basename(path), **kwargs)
+            meta = _video_meta(path)
+            return await app.send_video(
+                video=path, supports_streaming=True,
+                file_name=os.path.basename(path),
+                width=meta.get("width"), height=meta.get("height"),
+                duration=meta.get("duration"),
+                **kwargs,
+            )
         elif media == "photo":
             return await app.send_photo(photo=path, **kwargs)
         elif media == "audio":

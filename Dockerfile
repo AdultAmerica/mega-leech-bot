@@ -7,7 +7,7 @@ FROM python:3.12-slim-bookworm
 # replace the URL with the current one. Everything else can stay the same.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       wget ca-certificates gcc python3-dev \
+       wget ca-certificates gcc python3-dev ffmpeg \
     && wget -q "https://mega.nz/linux/repo/Debian_12/amd64/megacmd-Debian_12_amd64.deb" \
         -O /tmp/megacmd.deb \
     && (apt-get install -y /tmp/megacmd.deb \
