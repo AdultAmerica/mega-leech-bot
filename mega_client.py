@@ -114,27 +114,40 @@ async def download_file(remote_path: str, rel_path: str, dest_dir: str) -> str:
     rel_path is the file path relative to that folder.
     """
     os.makedirs(dest_dir, exist_ok=True)
-    # Remove any leftover file from a previous attempt so mega-get doesn't
-    # fail with "Already exists".
-    basename = os.path.basename(rel_path)
-    existing = os.path.join(dest_dir, basename)
-    if os.path.exists(existing):
-        os.remove(existing)
+    # Use a fresh temp directory per download to avoid MEGAcmd's
+    # "Already exists" error from leftover files or temp artifacts.
+    import shutil
+    import uuid
+    tmp_dir = os.path.join(dest_dir, f"_tmp_{uuid.uuid4().hex[:8]}")
+    os.makedirs(tmp_dir, exist_ok=True)
+
     full_remote = f"{remote_path.rstrip('/')}/{rel_path}"
-    code, out, err = await _run(["mega-get", full_remote, dest_dir], timeout=None)
+    code, out, err = await _run(["mega-get", full_remote, tmp_dir], timeout=None)
     if code != 0:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         raise RuntimeError(
             f"mega-get failed for {rel_path}: {err.strip() or out.strip()}"
         )
 
     basename = os.path.basename(rel_path)
-    direct = os.path.join(dest_dir, basename)
-    if os.path.exists(direct):
-        return direct
-    for root, _dirs, names in os.walk(dest_dir):
+    # Find the downloaded file in the temp dir
+    found = None
+    for root, _dirs, names in os.walk(tmp_dir):
         if basename in names:
-            return os.path.join(root, basename)
-    raise RuntimeError(f"Downloaded file not found for {rel_path}")
+            found = os.path.join(root, basename)
+            break
+
+    if not found:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError(f"Downloaded file not found for {rel_path}")
+
+    # Move to the main download dir
+    final = os.path.join(dest_dir, basename)
+    if os.path.exists(final):
+        os.remove(final)
+    shutil.move(found, final)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return final
 
 
 async def cleanup(remote_path: str) -> None:
