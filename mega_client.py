@@ -114,6 +114,12 @@ async def download_file(remote_path: str, rel_path: str, dest_dir: str) -> str:
     rel_path is the file path relative to that folder.
     """
     os.makedirs(dest_dir, exist_ok=True)
+    # Remove any leftover file from a previous attempt so mega-get doesn't
+    # fail with "Already exists".
+    basename = os.path.basename(rel_path)
+    existing = os.path.join(dest_dir, basename)
+    if os.path.exists(existing):
+        os.remove(existing)
     full_remote = f"{remote_path.rstrip('/')}/{rel_path}"
     code, out, err = await _run(["mega-get", full_remote, dest_dir], timeout=None)
     if code != 0:
