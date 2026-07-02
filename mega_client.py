@@ -123,23 +123,23 @@ async def download_file(remote_path: str, rel_path: str, dest_dir: str) -> str:
 
     full_remote = f"{remote_path.rstrip('/')}/{rel_path}"
     code, out, err = await _run(["mega-get", full_remote, tmp_dir], timeout=None)
-    if code != 0:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise RuntimeError(
-            f"mega-get failed for {rel_path}: {err.strip() or out.strip()}"
-        )
 
     basename = os.path.basename(rel_path)
     # Find the downloaded file in the temp dir
     found = None
     for root, _dirs, names in os.walk(tmp_dir):
         if basename in names:
-            found = os.path.join(root, basename)
-            break
+            candidate = os.path.join(root, basename)
+            if os.path.getsize(candidate) > 0:
+                found = candidate
+                break
 
+    # MEGAcmd sometimes reports "Already exists" even after a 100% transfer.
+    # If the file is there with non-zero size, treat it as success.
     if not found:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise RuntimeError(f"Downloaded file not found for {rel_path}")
+        blob = (out + err).strip()
+        raise RuntimeError(f"mega-get failed for {rel_path}: {blob}")
 
     # Move to the main download dir
     final = os.path.join(dest_dir, basename)
