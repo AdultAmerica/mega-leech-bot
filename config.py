@@ -33,9 +33,12 @@ API_HASH = _require("API_HASH")
 # --- Bot token (from @BotFather) ---
 BOT_TOKEN = _require("BOT_TOKEN")
 
-# --- Your numeric Telegram user id (from @userinfobot).
-#     Only this user is allowed to issue commands to the bot. ---
+# --- Telegram user ids allowed to control the bot.
+#     OWNER_ID is the primary owner. EXTRA_OWNERS is an optional comma-separated
+#     list of additional user ids (e.g. "123,456"). ---
 OWNER_ID = int(_require("OWNER_ID"))
+_extra = os.environ.get("EXTRA_OWNERS", "")
+OWNER_IDS = {OWNER_ID} | {int(x.strip()) for x in _extra.split(",") if x.strip()}
 
 # --- MEGA account credentials ---
 MEGA_EMAIL = _require("MEGA_EMAIL")
