@@ -78,43 +78,30 @@ async def _remove_imported(remote_path: str) -> None:
 async def list_folder(link: str):
     """
     Import a public folder link, then return a list of file paths relative
-    to the imported folder, recursively. The imported folder path is also
-    returned so the caller can pass it to download_file and cleanup.
+    to the imported folder, recursively.
+
+    Uses mega-find instead of mega-ls to avoid fragile directory-header
+    parsing — mega-find gives one clean full path per line.
 
     Returns (remote_path, files) where remote_path is the MEGA cloud path
     and files is a list of relative file paths.
     """
     remote_path = await _import_folder(link)
-    folder_name = remote_path.strip("/")
 
-    code, out, err = await _run(["mega-ls", "-R", remote_path], timeout=600)
+    code, out, err = await _run(
+        ["mega-find", remote_path, "--type=f"], timeout=600
+    )
     if code != 0:
-        raise RuntimeError(f"mega-ls failed: {err.strip() or out.strip()}")
+        raise RuntimeError(f"mega-find failed: {err.strip() or out.strip()}")
 
-    headers = set()
-    for line in out.splitlines():
-        if line.rstrip().endswith(":"):
-            headers.add(line.rstrip()[:-1].strip().lstrip("./").rstrip("/"))
-
+    prefix = remote_path.rstrip("/") + "/"
     files = []
-    current = ""
     for line in out.splitlines():
-        line = line.rstrip()
+        line = line.strip()
         if not line:
             continue
-        if line.endswith(":"):
-            current = line[:-1].strip().lstrip("./").rstrip("/")
-            continue
-        name = line.strip()
-        rel = f"{current}/{name}" if current else name
-        rel = rel.lstrip("/")
-        if rel in headers or name in headers:
-            continue
-        # Strip the folder name prefix — mega-ls includes it in headers
-        # but remote_path already points to the folder.
-        if rel.startswith(folder_name + "/"):
-            rel = rel[len(folder_name) + 1:]
-        files.append(rel)
+        if line.startswith(prefix):
+            files.append(line[len(prefix):])
 
     return remote_path, files
 
