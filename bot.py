@@ -298,6 +298,7 @@ async def help_cmd(_, message):
         "all chats I'm in\n"
         "`/chats` — show where I'll dump\n"
         "`/topic <chat_id> <topic_id>` — set a forum topic for a group\n"
+        "`/remove <chat_id>` — remove a chat from the dump list\n"
         "`/probe <mega folder url>` — show the raw MEGA listing (debug)\n"
         "`/cancel` — stop after the current file\n\n"
         "Add me to a group or channel (as admin in channels) and I'll start "
@@ -339,6 +340,20 @@ async def topic_cmd(_, message):
         await message.reply_text(f"Set topic `{topic_id}` for chat `{chat_id}`.")
     else:
         await message.reply_text(f"Cleared topic for chat `{chat_id}`.")
+
+
+@app.on_message(filters.command("remove") & OWNER)
+async def remove_cmd(_, message):
+    if len(message.command) < 2:
+        await message.reply_text("Usage: `/remove <chat_id>`\nGet the chat_id from `/chats`.")
+        return
+    try:
+        chat_id = int(message.command[1])
+    except ValueError:
+        await message.reply_text("chat_id must be a number.")
+        return
+    db.deactivate_chat(chat_id)
+    await message.reply_text(f"Removed `{chat_id}` from dump list.")
 
 
 @app.on_message(filters.command("probe") & OWNER)
