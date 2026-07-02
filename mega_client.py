@@ -85,6 +85,7 @@ async def list_folder(link: str):
     and files is a list of relative file paths.
     """
     remote_path = await _import_folder(link)
+    folder_name = remote_path.strip("/")
 
     code, out, err = await _run(["mega-ls", "-R", remote_path], timeout=600)
     if code != 0:
@@ -109,6 +110,10 @@ async def list_folder(link: str):
         rel = rel.lstrip("/")
         if rel in headers or name in headers:
             continue
+        # Strip the folder name prefix — mega-ls includes it in headers
+        # but remote_path already points to the folder.
+        if rel.startswith(folder_name + "/"):
+            rel = rel[len(folder_name) + 1:]
         files.append(rel)
 
     return remote_path, files
