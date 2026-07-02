@@ -297,6 +297,7 @@ async def help_cmd(_, message):
         "`/leech <mega folder url>` — download a folder and dump every file to "
         "all chats I'm in\n"
         "`/chats` — show where I'll dump\n"
+        "`/topic <chat_id> <topic_id>` — set a forum topic for a group\n"
         "`/probe <mega folder url>` — show the raw MEGA listing (debug)\n"
         "`/cancel` — stop after the current file\n\n"
         "Add me to a group or channel (as admin in channels) and I'll start "
@@ -310,10 +311,34 @@ async def chats_cmd(_, message):
     if not chats:
         await message.reply_text("I'm not in any chats yet.")
         return
-    lines = [
-        f"• {c['title'] or c['chat_id']} ({c['type']}) `{c['chat_id']}`" for c in chats
-    ]
+    lines = []
+    for c in chats:
+        topic = f" → topic `{c['thread_id']}`" if c["thread_id"] else ""
+        lines.append(f"• {c['title'] or c['chat_id']} ({c['type']}) `{c['chat_id']}`{topic}")
     await message.reply_text("I'll dump to:\n" + "\n".join(lines))
+
+
+@app.on_message(filters.command("topic") & OWNER)
+async def topic_cmd(_, message):
+    if len(message.command) < 3:
+        await message.reply_text(
+            "Usage: `/topic <chat_id> <topic_id>`\n"
+            "Set topic to `0` to clear it.\n\n"
+            "To find the topic ID: open the topic in Telegram Web, "
+            "the URL ends with `/123` — that number is the topic ID."
+        )
+        return
+    try:
+        chat_id = int(message.command[1])
+        topic_id = int(message.command[2])
+    except ValueError:
+        await message.reply_text("Both chat_id and topic_id must be numbers.")
+        return
+    db.set_chat_thread(chat_id, topic_id if topic_id != 0 else None)
+    if topic_id:
+        await message.reply_text(f"Set topic `{topic_id}` for chat `{chat_id}`.")
+    else:
+        await message.reply_text(f"Cleared topic for chat `{chat_id}`.")
 
 
 @app.on_message(filters.command("probe") & OWNER)
