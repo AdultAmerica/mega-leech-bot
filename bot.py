@@ -166,9 +166,9 @@ async def _upload_and_fanout(path, chats, status_msg):
 # ----------------------------------------------------------------------
 # Process one file end to end: download -> (split) -> upload -> clean up
 # ----------------------------------------------------------------------
-async def _process_file(link, rel_path, dest_dir, chats, status_msg, job_id):
+async def _process_file(remote_path, rel_path, dest_dir, chats, status_msg, job_id):
     await _safe_edit(status_msg, f"Downloading `{rel_path}` from MEGA...")
-    local = await mega_client.download_file(link, rel_path, dest_dir)
+    local = await mega_client.download_file(remote_path, rel_path, dest_dir)
     size = os.path.getsize(local)
 
     try:
@@ -203,11 +203,12 @@ async def run_leech(link, status_msg, requested_by, job_id=None):
         db.create_job(job_id, link, requested_by)
 
     _cancel.clear()
+    remote_path = None
     try:
         await mega_client.login()
 
-        await _safe_edit(status_msg, "Listing folder contents...")
-        files = await mega_client.list_folder(link)
+        await _safe_edit(status_msg, "Importing folder into MEGA account...")
+        remote_path, files = await mega_client.list_folder(link)
         if not files:
             await _safe_edit(
                 status_msg,
@@ -237,7 +238,7 @@ async def run_leech(link, status_msg, requested_by, job_id=None):
             await _safe_edit(status_msg, f"[{index}/{total}] {rel_path}")
             try:
                 await _process_file(
-                    link, rel_path, config.DOWNLOAD_DIR, chats, status_msg, job_id
+                    remote_path, rel_path, config.DOWNLOAD_DIR, chats, status_msg, job_id
                 )
             except Exception as e:
                 await app.send_message(requested_by, f"Failed on `{rel_path}`: {e}")
@@ -249,6 +250,9 @@ async def run_leech(link, status_msg, requested_by, job_id=None):
     except Exception as e:
         db.set_job_status(job_id, "error")
         await _safe_edit(status_msg, f"Job failed: {e}")
+    finally:
+        if remote_path:
+            await mega_client.cleanup(remote_path)
 
 
 # ----------------------------------------------------------------------

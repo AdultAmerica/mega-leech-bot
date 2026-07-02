@@ -5,13 +5,13 @@ MEGAcmd exposes commands prefixed with "mega-" (mega-login, mega-ls,
 mega-get, ...). Any of them auto-starts the background MEGAcmd server, so we
 just shell out to them with asyncio subprocesses.
 
-The one piece that can vary between MEGAcmd versions / folder types is how the
-recursive listing is printed, which `list_folder()` parses. If your first real
-run reports "no files found", use the bot's /probe command to dump the raw
-`mega-ls` text — then the parser below can be matched to it exactly.
+This version imports public folder links into the account before listing/
+downloading, because MEGAcmd 2.x requires it. After downloading, the
+imported folder is removed from the account to keep it clean.
 """
 import asyncio
 import os
+import re
 
 import config
 
@@ -47,33 +47,49 @@ async def login() -> None:
 
 async def raw_ls(link: str) -> str:
     """Return the raw recursive listing for a folder link (used by /probe)."""
-    _, out, err = await _run(["mega-ls", "-l", "-R", link], timeout=300)
-    return out or err
+    remote_path = await _import_folder(link)
+    try:
+        _, out, err = await _run(["mega-ls", "-l", "-R", remote_path], timeout=300)
+        return out or err
+    finally:
+        await _remove_imported(remote_path)
+
+
+async def _import_folder(link: str) -> str:
+    """Import a public folder link and return the remote path it was imported to."""
+    code, out, err = await _run(["mega-import", link], timeout=300)
+    blob = out + err
+    m = re.search(r"Imported folder complete:\s*(.+)", blob)
+    if m:
+        return m.group(1).strip()
+    if code != 0:
+        raise RuntimeError(f"mega-import failed: {blob.strip()}")
+    raise RuntimeError(f"Could not parse imported path from: {blob.strip()}")
+
+
+async def _remove_imported(remote_path: str) -> None:
+    """Remove an imported folder from the account (cleanup)."""
+    try:
+        await _run(["mega-rm", "-r", "-f", remote_path], timeout=120)
+    except Exception:
+        pass
 
 
 async def list_folder(link: str):
     """
-    Return a list of file paths *relative to the folder link*, recursively.
+    Import a public folder link, then return a list of file paths relative
+    to the imported folder, recursively. The imported folder path is also
+    returned so the caller can pass it to download_file and cleanup.
 
-    MEGAcmd's `mega-ls -R` prints one directory block at a time, e.g.:
-
-        .:
-        movie_a.mkv
-        subdir
-
-        ./subdir:
-        movie_b.mkv
-
-    We track the current directory header (a line ending in ':') and join it
-    with each entry under it. Entries that are themselves directories (they
-    appear again later as their own header) are skipped, so only leaf files
-    are returned.
+    Returns (remote_path, files) where remote_path is the MEGA cloud path
+    and files is a list of relative file paths.
     """
-    code, out, err = await _run(["mega-ls", "-R", link], timeout=600)
+    remote_path = await _import_folder(link)
+
+    code, out, err = await _run(["mega-ls", "-R", remote_path], timeout=600)
     if code != 0:
         raise RuntimeError(f"mega-ls failed: {err.strip() or out.strip()}")
 
-    # First pass: collect every directory header so we can exclude folders.
     headers = set()
     for line in out.splitlines():
         if line.rstrip().endswith(":"):
@@ -92,27 +108,22 @@ async def list_folder(link: str):
         rel = f"{current}/{name}" if current else name
         rel = rel.lstrip("/")
         if rel in headers or name in headers:
-            continue  # this entry is a directory, not a file
+            continue
         files.append(rel)
 
-    return files
+    return remote_path, files
 
 
-async def download_file(link: str, rel_path: str, dest_dir: str) -> str:
+async def download_file(remote_path: str, rel_path: str, dest_dir: str) -> str:
     """
-    Download a single file (addressed by its path inside the public folder
-    link) into dest_dir, and return the local file path.
+    Download a single file from the imported folder in the MEGA cloud.
 
-    The folder-link-plus-subpath form is what MEGAcmd accepts, e.g.:
-        mega-get "https://mega.nz/folder/XXX#KEY/subdir/movie.mkv" /data/downloads
-
-    MEGAcmd resumes partially downloaded files on its own, which is why a
-    restart mid-download is not fatal.
+    remote_path is the MEGA cloud path returned by list_folder().
+    rel_path is the file path relative to that folder.
     """
     os.makedirs(dest_dir, exist_ok=True)
-    remote = f"{link.rstrip('/')}/{rel_path}"
-    # No timeout: large files can legitimately take a long time.
-    code, out, err = await _run(["mega-get", remote, dest_dir], timeout=None)
+    full_remote = f"{remote_path.rstrip('/')}/{rel_path}"
+    code, out, err = await _run(["mega-get", full_remote, dest_dir], timeout=None)
     if code != 0:
         raise RuntimeError(
             f"mega-get failed for {rel_path}: {err.strip() or out.strip()}"
@@ -122,8 +133,12 @@ async def download_file(link: str, rel_path: str, dest_dir: str) -> str:
     direct = os.path.join(dest_dir, basename)
     if os.path.exists(direct):
         return direct
-    # MEGAcmd may recreate the subfolder structure under dest_dir; find the file.
     for root, _dirs, names in os.walk(dest_dir):
         if basename in names:
             return os.path.join(root, basename)
     raise RuntimeError(f"Downloaded file not found for {rel_path}")
+
+
+async def cleanup(remote_path: str) -> None:
+    """Remove the imported folder from the MEGA account after a job completes."""
+    await _remove_imported(remote_path)
