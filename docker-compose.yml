@@ -1,6 +1,8 @@
 services:
+  # ── Bot 1: your existing bot. Unchanged behaviour. ─────────────────────────
   leech-bot:
     build: .
+    image: mega-leech-bot
     container_name: mega-leech-bot
     restart: unless-stopped
     env_file: .env
@@ -9,5 +11,27 @@ services:
     volumes:
       - bot-data:/data
 
+  # ── Bot 2: a completely separate bot for another user. ─────────────────────
+  # Own Telegram token + owner (in .env.bot2), its own destination chats, its
+  # own SQLite database and its own MEGAcmd session (its own bot2-data volume),
+  # so nothing it does touches bot 1. It shares this MEGA account unless you put
+  # different MEGA_EMAIL / MEGA_PASSWORD in .env.bot2.
+  #
+  # It only starts when you ask for it, so bot 1 keeps working on its own:
+  #   start both : docker compose --profile bot2 up -d --build
+  #   start bot1 : docker compose up -d --build
+  leech-bot2:
+    build: .
+    image: mega-leech-bot
+    container_name: mega-leech-bot2
+    restart: unless-stopped
+    env_file: .env.bot2
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - bot2-data:/data
+    profiles: ["bot2"]
+
 volumes:
   bot-data:
+  bot2-data:

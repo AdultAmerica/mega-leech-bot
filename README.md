@@ -55,6 +55,72 @@ channels the bot has been added to. Built to run on Railway.
    tweak is the MEGAcmd download in the `Dockerfile` (see the comment there).
 6. When the deploy logs show `Bot @yourbot started.`, message your bot `/start`.
 
+## Add a second bot for another user (docker-compose)
+
+Want a second person to run their own leech bot — their own commands, their own
+channels — separate from yours? Add a second bot instance. Each bot is fully
+isolated: its own Telegram token, its own owner, its own destination chats, its
+own database, and its own MEGAcmd session (its own volume). This is different
+from `EXTRA_OWNERS`, which lets extra people command *your* bot and share *your*
+destination chats — use a second bot when the other user needs their **own**
+space.
+
+Why a second container instead of one bot? The download side uses **MEGAcmd**,
+which keeps a single background session per container. One container per bot
+gives each its own session, so they never step on each other — even when both
+log into the **same** MEGA account (MEGA allows several sessions per account).
+
+The second bot is already defined in `docker-compose.yml` under the `bot2`
+profile, so it stays off until you switch it on. On the VPS (in
+`/opt/mega-leech-bot`):
+
+1. Create the bot in Telegram: message [@BotFather](https://t.me/BotFather),
+   send `/newbot`, and copy the **token** it gives you.
+2. Get the other user's numeric id: they message
+   [@userinfobot](https://t.me/userinfobot) from their own account.
+3. Make the second bot's env file by copying your working `.env`, then change
+   just the token and owner:
+   ```bash
+   cp .env .env.bot2
+   nano .env.bot2
+   #   BOT_TOKEN=<the new token from BotFather>
+   #   OWNER_ID=<the other user's numeric id>
+   #   leave API_ID / API_HASH / MEGA_EMAIL / MEGA_PASSWORD / DATA_DIR as-is
+   ```
+   (Sharing your MEGA account is fine — just note both bots then draw from that
+   account's transfer quota. For a fully separate account, put different MEGA
+   credentials in `.env.bot2`.)
+4. Start both bots:
+   ```bash
+   docker compose --profile bot2 up -d --build
+   docker compose --profile bot2 logs -f      # wait for "Bot @... started." from both
+   ```
+   Your first bot keeps running as before; the new container
+   (`mega-leech-bot2`) is the second user's bot.
+5. The other user messages **their** bot `/start`, adds it to **their own**
+   group/channel (as admin in channels), and runs `/leech`. Their files land
+   only in their chats.
+
+To manage just the second bot later: `docker compose --profile bot2 restart leech-bot2`
+(or `stop` / `up -d`). Running `docker compose up -d` **without** `--profile bot2`
+only touches bot 1, so your existing deploy flow is unchanged.
+
+## Which folder is live on the VPS
+
+The bot runs from **`/opt/mega-leech-bot`**, on the branch
+`claude/leech-bot-telegram-deploy-9mlnve`. Always run the `git` and
+`docker compose` commands there.
+
+Older clones may exist on the server (e.g. `/root/mega-leech-bot`,
+`/opt/leechbot`) — these are stale and **not** what's running. Ignore them, or
+remove them once you've confirmed everything works, to avoid editing the wrong
+copy:
+
+```bash
+# confirm which one is live first — this is the deployed folder:
+cd /opt/mega-leech-bot && git rev-parse --abbrev-ref HEAD   # -> claude/leech-bot-telegram-deploy-9mlnve
+```
+
 ## First run — validate small
 
 Before a big folder, test with a small public folder (2–3 files):
