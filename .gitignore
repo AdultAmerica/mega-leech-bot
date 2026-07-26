@@ -1,5 +1,7 @@
 # Secrets — never commit these
 .env
+# Second bot's env file (docker-compose profile "bot2")
+.env.bot2
 
 # Pyrogram/Kurigram session files
 *.session
