@@ -105,6 +105,22 @@ To manage just the second bot later: `docker compose --profile bot2 restart leec
 (or `stop` / `up -d`). Running `docker compose up -d` **without** `--profile bot2`
 only touches bot 1, so your existing deploy flow is unchanged.
 
+## Which folder is live on the VPS
+
+The bot runs from **`/opt/mega-leech-bot`**, on the branch
+`claude/leech-bot-telegram-deploy-9mlnve`. Always run the `git` and
+`docker compose` commands there.
+
+Older clones may exist on the server (e.g. `/root/mega-leech-bot`,
+`/opt/leechbot`) — these are stale and **not** what's running. Ignore them, or
+remove them once you've confirmed everything works, to avoid editing the wrong
+copy:
+
+```bash
+# confirm which one is live first — this is the deployed folder:
+cd /opt/mega-leech-bot && git rev-parse --abbrev-ref HEAD   # -> claude/leech-bot-telegram-deploy-9mlnve
+```
+
 ## First run — validate small
 
 Before a big folder, test with a small public folder (2–3 files):
