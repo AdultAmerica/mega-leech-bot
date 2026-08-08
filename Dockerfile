@@ -2,9 +2,12 @@
 FROM python:3.12-slim-bookworm
 
 # --- Install MEGAcmd from MEGA's official Debian package ---------------------
-# If the Railway build fails on this step, the most likely cause is the .deb
-# URL below: open https://mega.nz/cmd , find the "Debian 12" download link, and
+# If the build fails on this step, the most likely cause is the .deb URL
+# below: open https://mega.nz/cmd , find the "Debian 12" download link, and
 # replace the URL with the current one. Everything else can stay the same.
+#
+# gcc + python3-dev are here so tgcrypto can compile; ffmpeg provides the
+# ffprobe used to read video dimensions before uploading.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        wget ca-certificates gcc python3-dev ffmpeg \
