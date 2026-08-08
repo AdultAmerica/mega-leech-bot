@@ -7,5 +7,9 @@ kurigram
 # the bot still works, just a little slower.
 tgcrypto
 
+# CPU / RAM / network figures for the /stats and /sys panels. Optional:
+# the panels fall back to disk usage and load average without it.
+psutil
+
 # Loads the .env file during local development.
 python-dotenv

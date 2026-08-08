@@ -1,63 +1,80 @@
 """
 MEGA -> Telegram leech bot.
 
-Commands (owner only):
-  /start, /help              show help
-  /leech <mega folder url>   download the folder and dump every file to all
-                             chats the bot is currently in
-  /chats                     list the chats the bot will dump to
-  /addchat <chat_id>         manually add a chat to the dump list
-  /remove <chat_id>          remove a chat from the dump list
-  /topic <chat_id> <id>      set a forum topic for a group
-  /status                    show current job progress and disk usage
-  /disk                      show disk space
-  /cleanup                   delete leftover downloads to free disk
-  /probe <mega folder url>   dump the raw MEGA listing (for debugging)
-  /cancel                    stop the current job after the file in progress
-  /id                        show your Telegram user id
+Everything the user touches lives here: commands, inline-button callbacks, and
+the membership tracker that keeps the destination list current. The actual
+work happens elsewhere — tasks.py runs the pipeline, ui.py draws the panels,
+keyboards.py builds the buttons — so this file stays a routing table.
 
 How it works:
   - The bot AUTO-TRACKS destinations. When it is added to (or made admin in) a
     group or channel it records that chat; when it is removed it stops dumping
-    there. (You can list them with /chats.)
+    there. /chats lists them and lets you pause one without removing the bot,
+    and /addchat / /remove cover the cases auto-tracking can't see.
   - Each file is uploaded ONCE to the first chat and then copied to the other
-    chats by file id, so upload bandwidth is paid a single time no matter how
-    many chats you dump to.
-  - Files larger than ~2 GB are split into parts automatically.
-  - Progress is saved in SQLite, so if the server restarts mid-job the bot
+    chats, so upload bandwidth is paid a single time no matter how many chats
+    you dump to.
+  - Files larger than the configured split size are split into parts.
+  - Progress is saved in SQLite, so if the container restarts mid-job the bot
     resumes where it left off instead of starting over.
 """
 import asyncio
-import json
+import html
+import logging
 import os
-import shutil
-import subprocess
+import sys
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from logging.handlers import RotatingFileHandler
 
 from pyrogram import Client, filters, idle
-from pyrogram.enums import ChatMemberStatus
-from pyrogram.errors import FloodWait
-from pyrogram.types import ChatMemberUpdated
+from pyrogram.enums import ChatMemberStatus, ParseMode
+from pyrogram.errors import MessageNotModified
+from pyrogram.types import BotCommand, ChatMemberUpdated
 
 import config
 import db
+import keyboards
 import mega_client
+import tasks
+import ui
 import utils
+
+VERSION = "2.0"
+
+# ----------------------------------------------------------------------
+# Logging: rotating file (served by /log) plus stdout for `docker compose logs`
+# ----------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        RotatingFileHandler(config.LOG_PATH, maxBytes=2_000_000, backupCount=2),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+log = logging.getLogger("bot")
 
 app = Client(
     "leech_bot",
     api_id=config.API_ID,
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
-    workdir=config.DATA_DIR,
+    workdir=config.DATA_DIR,        # keep the .session file on the volume
 )
 
-BOT_ID = None
-_busy = asyncio.Lock()
-_cancel = asyncio.Event()
-_current_job_info = {}  # tracks progress for /status
+BOT_ID = None                       # filled in at startup
+START_TIME = time.time()
+RESTART_FLAG = os.path.join(config.DATA_DIR, "restart.json")
+
+# Folder previews from /list, keyed by a short token so the callback data for
+# "Start leech" stays inside Telegram's 64-byte limit.
+_previews = {}
+PREVIEW_PAGE = 12
+CHATS_PAGE = 6
 
 ACTIVE_STATUSES = {
     ChatMemberStatus.MEMBER,
@@ -65,17 +82,47 @@ ACTIVE_STATUSES = {
     ChatMemberStatus.OWNER,
 }
 
+COMMANDS = [
+    ("start", "Open the main menu"),
+    ("leech", "Queue a MEGA folder"),
+    ("list", "Preview a MEGA folder before leeching"),
+    ("status", "Live dashboard for the running task"),
+    ("queue", "Show queued tasks"),
+    ("cancel", "Cancel a task"),
+    ("chats", "Manage destination chats"),
+    ("settings", "Look and behaviour"),
+    ("stats", "Lifetime totals and machine health"),
+    ("disk", "Disk space and downloads folder"),
+    ("cleanup", "Delete leftover downloads"),
+    ("ping", "Round-trip latency"),
+    ("id", "Show chat and user ids"),
+    ("log", "Download the log file"),
+    ("help", "Full command reference"),
+]
+
+OTHER_COMMANDS = [
+    "probe", "topic", "users", "restart", "sys", "addchat", "remove",
+    "prefix", "suffix", "setthumb", "delthumb", "mirror",
+]
+
 
 # ----------------------------------------------------------------------
-# Health-check web server
+# Health-check web server (lets an external monitor confirm the bot is up)
 # ----------------------------------------------------------------------
 def _start_health_server():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            running = tasks.manager.current
+            body = (
+                f"OK\nuptime={int(time.time() - START_TIME)}s\n"
+                f"running={running.id if running else 'none'}\n"
+                f"queued={len(tasks.manager.pending)}\n"
+            ).encode()
             self.send_response(200)
             self.send_header("Content-type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b"OK")
+            self.wfile.write(body)
 
         def log_message(self, *_):
             pass
@@ -84,437 +131,793 @@ def _start_health_server():
 
 
 # ----------------------------------------------------------------------
-# Small helpers
+# Auth: owners can do everything, sudo users can run jobs and change settings
 # ----------------------------------------------------------------------
-def _owner_only(_, __, message):
-    return message.from_user is not None and message.from_user.id in config.OWNER_IDS
+def _is_owner(user_id) -> bool:
+    return user_id in config.OWNER_IDS
 
 
-OWNER = filters.create(_owner_only)
+def _is_authorized(user_id) -> bool:
+    if _is_owner(user_id):
+        return True
+    return user_id in config.SUDO_USERS or user_id in db.get_user_ids()
 
 
-async def _safe_edit(message, text):
-    try:
-        await message.edit_text(text)
-    except Exception:
-        pass
+def _auth_filter(_, __, update):
+    user = getattr(update, "from_user", None)
+    return user is not None and _is_authorized(user.id)
 
 
-def _disk_usage():
-    st = os.statvfs("/")
-    total = st.f_blocks * st.f_frsize
-    free = st.f_bavail * st.f_frsize
-    used = total - free
-    return utils.human(used), utils.human(total), utils.human(free)
+AUTH = filters.create(_auth_filter)
+ALL_COMMANDS = [c for c, _ in COMMANDS] + OTHER_COMMANDS
 
 
-# ----------------------------------------------------------------------
-# Upload one file, then fan it out to the other chats with no re-upload
-# ----------------------------------------------------------------------
-_VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v"}
-_PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
-_AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".wav", ".m4a", ".aac", ".opus", ".wma"}
+@app.on_message(filters.command(ALL_COMMANDS) & filters.private & ~AUTH)
+async def deny(_, message):
+    """
+    Anyone who isn't an owner or a sudo user gets a single clear no.
 
-
-def _media_type(path):
-    ext = os.path.splitext(path)[1].lower()
-    if ext in _VIDEO_EXTS:
-        return "video"
-    if ext in _PHOTO_EXTS:
-        return "photo"
-    if ext in _AUDIO_EXTS:
-        return "audio"
-    return "document"
-
-
-def _video_meta(path):
-    try:
-        r = subprocess.run(
-            [
-                "ffprobe", "-v", "quiet", "-print_format", "json",
-                "-show_streams", "-select_streams", "v:0", path,
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        info = json.loads(r.stdout)
-        s = info["streams"][0]
-        return {
-            "width": int(s.get("width", 0)) or None,
-            "height": int(s.get("height", 0)) or None,
-            "duration": int(float(s.get("duration", 0))) or None,
-        }
-    except Exception:
-        return {}
-
-
-async def _send_media(chat_id, path, media, thread_id, progress):
-    kwargs = dict(chat_id=chat_id, message_thread_id=thread_id or None, progress=progress)
-    try:
-        if media == "video":
-            meta = _video_meta(path)
-            return await app.send_video(
-                video=path, supports_streaming=True,
-                file_name=os.path.basename(path),
-                width=meta.get("width"), height=meta.get("height"),
-                duration=meta.get("duration"),
-                **kwargs,
-            )
-        elif media == "photo":
-            return await app.send_photo(photo=path, **kwargs)
-        elif media == "audio":
-            return await app.send_audio(audio=path, file_name=os.path.basename(path), **kwargs)
-    except Exception as e:
-        print(f"Media send as {media} failed ({e}), falling back to document")
-    return await app.send_document(document=path, file_name=os.path.basename(path), **kwargs)
-
-
-async def _upload_and_fanout(path, chats, status_msg):
-    name = os.path.basename(path)
-    throttle = utils.ProgressThrottle()
-    media = _media_type(path)
-    print(f"Uploading {name} as {media}")
-
-    async def _progress(current, total):
-        if throttle.should_edit(current, total):
-            pct = current * 100 // total if total else 0
-            await _safe_edit(
-                status_msg,
-                f"Uploading `{name}`\n{utils.human(current)} / {utils.human(total)} ({pct}%)",
-            )
-
-    first = chats[0]
-    sent = None
-    while True:
-        try:
-            sent = await _send_media(first["chat_id"], path, media, first["thread_id"], _progress)
-            break
-        except FloodWait as e:
-            await _safe_edit(status_msg, f"Rate limited, waiting {e.value}s...")
-            await asyncio.sleep(e.value)
-
-    if sent is None:
-        return
-
-    for chat in chats[1:]:
-        while True:
-            try:
-                await sent.copy(
-                    chat_id=chat["chat_id"],
-                    message_thread_id=chat["thread_id"] or None,
-                )
-                break
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
-            except Exception:
-                break
-
-
-# ----------------------------------------------------------------------
-# Process one file end to end: download -> (split) -> upload -> clean up
-# ----------------------------------------------------------------------
-async def _process_file(remote_path, rel_path, dest_dir, chats, status_msg, job_id):
-    await _safe_edit(status_msg, f"Downloading `{rel_path}` from MEGA...")
-    local = await mega_client.download_file(remote_path, rel_path, dest_dir)
-    size = os.path.getsize(local)
-
-    try:
-        if size > config.MAX_PART_SIZE:
-            await _safe_edit(
-                status_msg, f"`{rel_path}` is {utils.human(size)} — splitting..."
-            )
-            for part in utils.split_file(local):
-                await _upload_and_fanout(part, chats, status_msg)
-                try:
-                    os.remove(part)
-                except OSError:
-                    pass
-        else:
-            await _upload_and_fanout(local, chats, status_msg)
-    finally:
-        if os.path.exists(local):
-            try:
-                os.remove(local)
-            except OSError:
-                pass
-
-    db.mark_file_done(job_id, rel_path)
-
-
-# ----------------------------------------------------------------------
-# The leech job
-# ----------------------------------------------------------------------
-async def run_leech(link, status_msg, requested_by, job_id=None):
-    if job_id is None:
-        job_id = uuid.uuid4().hex[:12]
-        db.create_job(job_id, link, requested_by)
-
-    _cancel.clear()
-    remote_path = None
-    try:
-        await mega_client.login()
-
-        await _safe_edit(status_msg, "Importing folder into MEGA account...")
-        remote_path, files = await mega_client.list_folder(link)
-        if not files:
-            await _safe_edit(
-                status_msg,
-                "No files found. Run `/probe <link>` so I can check the raw listing.",
-            )
-            db.set_job_status(job_id, "error")
-            return
-
-        chats = [dict(c) for c in db.get_active_chats()]
-        if not chats:
-            await _safe_edit(
-                status_msg,
-                "I'm not in any groups or channels yet. Add me (as admin in "
-                "channels), then run /leech again.",
-            )
-            db.set_job_status(job_id, "error")
-            return
-
-        total = len(files)
-        _current_job_info.update(
-            job_id=job_id, link=link, total=total, current=0, file=""
-        )
-
-        for index, rel_path in enumerate(files, start=1):
-            if _cancel.is_set():
-                await _safe_edit(status_msg, "Cancelled.")
-                db.set_job_status(job_id, "cancelled")
-                return
-            if db.is_file_done(job_id, rel_path):
-                _current_job_info["current"] = index
-                continue
-            _current_job_info.update(current=index, file=rel_path)
-            await _safe_edit(status_msg, f"[{index}/{total}] {rel_path}")
-            try:
-                await _process_file(
-                    remote_path, rel_path, config.DOWNLOAD_DIR, chats, status_msg, job_id
-                )
-            except Exception as e:
-                await app.send_message(requested_by, f"Failed on `{rel_path}`: {e}")
-
-        db.set_job_status(job_id, "done")
-        await _safe_edit(
-            status_msg, f"Done — {total} files dumped to {len(chats)} chat(s)."
-        )
-    except Exception as e:
-        db.set_job_status(job_id, "error")
-        await _safe_edit(status_msg, f"Job failed: {e}")
-    finally:
-        _current_job_info.clear()
-        if remote_path:
-            await mega_client.cleanup(remote_path)
-
-
-# ----------------------------------------------------------------------
-# Command handlers (all owner-only)
-# ----------------------------------------------------------------------
-@app.on_message(filters.command(["start", "help"]) & OWNER)
-async def help_cmd(_, message):
+    Private chats only: the bot sits in the dump channels too, and a stranger
+    typing /start there shouldn't make it talk in front of an audience.
+    """
     await message.reply_text(
-        "**MEGA → Telegram leech bot**\n\n"
-        "**Leeching:**\n"
-        "`/leech <mega folder url>` — download & dump to all chats\n"
-        "`/cancel` — stop after the current file\n"
-        "`/status` — show current job progress + disk\n\n"
-        "**Chat management:**\n"
-        "`/chats` — list dump destinations\n"
-        "`/addchat <chat_id>` — manually add a chat\n"
-        "`/remove <chat_id>` — remove a chat\n"
-        "`/topic <chat_id> <topic_id>` — set forum topic (0 to clear)\n\n"
-        "**Utilities:**\n"
-        "`/disk` — show disk space\n"
-        "`/cleanup` — delete leftover downloads\n"
-        "`/probe <mega folder url>` — raw MEGA listing (debug)\n"
-        "`/id` — show your Telegram user id\n\n"
-        "Add me to a group or channel (as admin in channels) and I'll "
-        "auto-track it as a dump destination."
+        ui.panel(
+            "ACCESS DENIED",
+            [
+                f"{ui.E['key']} This bot is private.",
+                f"{ui.E['user']} Your id: "
+                f"<code>{message.from_user.id if message.from_user else '?'}</code>",
+                "",
+                "Ask the owner to add you with "
+                "<code>/users add &lt;your id&gt;</code>.",
+            ],
+            ui.E["stop"],
+        ),
+        parse_mode=ParseMode.HTML,
     )
 
 
-@app.on_message(filters.command("chats") & OWNER)
-async def chats_cmd(_, message):
-    chats = db.get_active_chats()
-    if not chats:
-        await message.reply_text("I'm not in any chats yet.")
-        return
-    lines = []
-    for c in chats:
-        topic = f" → topic `{c['thread_id']}`" if c["thread_id"] else ""
-        lines.append(f"• {c['title'] or c['chat_id']} ({c['type']}) `{c['chat_id']}`{topic}")
-    await message.reply_text("I'll dump to:\n" + "\n".join(lines))
+# ----------------------------------------------------------------------
+# Reply helpers — every outgoing message goes through these so parse mode,
+# link previews and keyboards stay consistent.
+# ----------------------------------------------------------------------
+async def reply(message, text, kb=None):
+    return await message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+        disable_web_page_preview=True,
+        quote=False,
+    )
 
 
-@app.on_message(filters.command("addchat") & OWNER)
-async def addchat_cmd(_, message):
-    if len(message.command) < 2:
-        await message.reply_text(
-            "Usage: `/addchat <chat_id>`\n"
-            "The bot must already be a member of the chat."
+async def edit(message, text, kb=None):
+    try:
+        return await message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except MessageNotModified:
+        return message
+
+
+def _arg(message, default=""):
+    """Everything after the command word, as one string."""
+    parts = message.text.split(None, 1) if message.text else []
+    return parts[1].strip() if len(parts) > 1 else default
+
+
+# ----------------------------------------------------------------------
+# Core commands
+# ----------------------------------------------------------------------
+@app.on_message(filters.command(["start"]) & AUTH)
+async def start_cmd(_, message):
+    name = message.from_user.first_name if message.from_user else "there"
+    chats = len(db.get_active_chats())
+    await reply(
+        message,
+        ui.welcome(name, config.BRAND, chats, VERSION),
+        keyboards.main_menu(has_task=tasks.manager.current is not None),
+    )
+
+
+@app.on_message(filters.command(["help"]) & AUTH)
+async def help_cmd(_, message):
+    await reply(message, ui.help_panel("main"), keyboards.help_menu("main"))
+
+
+@app.on_message(filters.command(["leech", "mirror"]) & AUTH)
+async def leech_cmd(_, message):
+    raw = _arg(message)
+    if not raw and message.reply_to_message:
+        raw = (message.reply_to_message.text or "").strip()
+    if not raw:
+        await reply(
+            message,
+            ui.panel(
+                "USAGE",
+                [
+                    f"{ui.E['arrow']} <code>/leech &lt;mega folder url&gt;</code>",
+                    f"{ui.E['arrow']} <code>/leech &lt;url&gt; | Custom title</code>",
+                    "",
+                    "You can also reply to a message containing the link.",
+                ],
+                ui.E["rocket"],
+            ),
         )
         return
-    try:
-        chat_id = int(message.command[1])
-    except ValueError:
-        await message.reply_text("chat_id must be a number.")
+
+    url, _, title = raw.partition("|")
+    url, title = url.strip(), title.strip()
+    if not mega_client.is_mega_link(url):
+        await reply(
+            message,
+            ui.panel(
+                "NOT A MEGA LINK",
+                [
+                    f"{ui.E['fail']} <code>{ui.esc(ui.trunc(url, 60))}</code>",
+                    "",
+                    "Expected something like "
+                    "<code>https://mega.nz/folder/AbCdEf#key</code>.",
+                ],
+                ui.E["warn"],
+            ),
+        )
         return
+
+    await _enqueue(message, url, title or None)
+
+
+async def _enqueue(message, url, title=None):
+    task = tasks.Task(url, message.from_user.id, title=title)
+    settings = db.get_settings()
+    task.status_msg = await reply(
+        message, ui.task_panel(task, settings),
+        keyboards.task_controls(task.id, task.state),
+    )
+    position = tasks.manager.add(task)
+    log.info("queued task %s (%s) at position %s", task.id, url, position)
+
+
+@app.on_message(filters.command(["list"]) & AUTH)
+async def list_cmd(_, message):
+    url = _arg(message)
+    if not mega_client.is_mega_link(url):
+        await reply(message, ui.panel(
+            "USAGE", [f"{ui.E['arrow']} <code>/list &lt;mega folder url&gt;</code>"],
+            ui.E["folder"]))
+        return
+
+    status = await reply(
+        message,
+        ui.panel("FOLDER PREVIEW",
+                 [f"{ui.E['hourglass']} Importing the folder and reading it…"],
+                 ui.E["folder"]),
+    )
     try:
-        chat = await app.get_chat(chat_id)
-        db.add_or_update_chat(chat.id, chat.title, str(chat.type))
-        await message.reply_text(f"Added **{chat.title}** (`{chat.id}`).")
+        await mega_client.login()
+        files = await mega_client.preview_folder(url)
     except Exception as e:
-        await message.reply_text(f"Failed: {e}")
+        await edit(status, ui.panel("PREVIEW FAILED",
+                                    [f"{ui.E['fail']} <code>{ui.esc(e)}</code>"],
+                                    ui.E["warn"]))
+        return
+
+    if not files:
+        await edit(status, ui.panel(
+            "EMPTY", [f"{ui.E['info']} Nothing found. Try <code>/probe</code> for the "
+                      f"raw listing."], ui.E["folder"]))
+        return
+
+    token = uuid.uuid4().hex[:6]
+    _previews[token] = {
+        "url": url,
+        "title": mega_client.link_label(url),
+        "files": files,
+        "total": sum(f.get("size") or 0 for f in files),
+    }
+    while len(_previews) > 20:                 # keep only the recent previews
+        _previews.pop(next(iter(_previews)))
+    await edit(status, _render_preview(token, 0), _preview_kb(token, 0))
 
 
-@app.on_message(filters.command("remove") & OWNER)
-async def remove_cmd(_, message):
-    if len(message.command) < 2:
-        await message.reply_text("Usage: `/remove <chat_id>`\nGet the chat_id from `/chats`.")
+def _preview_pages(preview):
+    return max(1, (len(preview["files"]) + PREVIEW_PAGE - 1) // PREVIEW_PAGE)
+
+
+def _render_preview(token, page):
+    preview = _previews.get(token)
+    if preview is None:
+        return ui.panel("EXPIRED",
+                        [f"{ui.E['info']} That preview is gone — run /list again."],
+                        ui.E["warn"])
+    pages = _preview_pages(preview)
+    page = max(0, min(page, pages - 1))
+    start = page * PREVIEW_PAGE
+    return ui.listing_panel(
+        preview["title"], preview["files"][start:start + PREVIEW_PAGE],
+        preview["total"], page, pages, start,
+    )
+
+
+def _preview_kb(token, page):
+    preview = _previews.get(token)
+    if preview is None:
+        return keyboards.back_home()
+    return keyboards.listing_controls(token, page, _preview_pages(preview))
+
+
+@app.on_message(filters.command(["probe"]) & AUTH)
+async def probe_cmd(_, message):
+    url = _arg(message)
+    if not url:
+        await reply(message, ui.panel(
+            "USAGE", [f"{ui.E['arrow']} <code>/probe &lt;mega folder url&gt;</code>"],
+            ui.E["info"]))
+        return
+    status = await reply(message, f"{ui.E['hourglass']} Importing and listing…")
+    try:
+        await mega_client.login()
+        raw = await mega_client.raw_ls(url)
+    except Exception as e:
+        await edit(status, ui.panel("PROBE FAILED",
+                                    [f"{ui.E['fail']} <code>{ui.esc(e)}</code>"],
+                                    ui.E["warn"]))
+        return
+    raw = (raw or "(empty)")[:3500]
+    await edit(status, f"{ui.header('RAW LISTING', ui.E['folder'])}\n"
+                       f"<pre>{html.escape(raw)}</pre>")
+
+
+@app.on_message(filters.command(["status"]) & AUTH)
+async def status_cmd(_, message):
+    await reply(message, *_status_view())
+
+
+def _status_view():
+    task = tasks.manager.current
+    settings = db.get_settings()
+    if task is None:
+        pending = list(tasks.manager.pending)
+        if pending:
+            return (ui.queue_panel(None, pending), keyboards.queue_controls(pending))
+        info = utils.sysinfo()
+        return (
+            ui.panel(
+                "IDLE",
+                [
+                    f"{ui.E['info']} Nothing is running.",
+                    "",
+                    "Send <code>/leech &lt;mega url&gt;</code> to start one.",
+                    ui.RULE,
+                    ui.kv("Free disk", ui.human(utils.free_space()), ui.E["disk"]),
+                ] + (ui.sysinfo_rows(info)[:2] if info else []),
+                ui.E["chart"],
+            ),
+            keyboards.main_menu(),
+        )
+    text = ui.task_panel(task, settings)
+    if task.failed:
+        text += "\n" + ui.RULE + "\n" + "\n".join(
+            f"{ui.E['fail']} <code>{ui.esc(ui.trunc(path, 34))}</code> — "
+            f"{ui.esc(ui.trunc(err, 60))}"
+            for path, err in task.failed[-5:]
+        )
+    return (text, keyboards.task_controls(task.id, task.state))
+
+
+@app.on_message(filters.command(["queue"]) & AUTH)
+async def queue_cmd(_, message):
+    pending = list(tasks.manager.pending)
+    await reply(
+        message,
+        ui.queue_panel(tasks.manager.current, pending),
+        keyboards.queue_controls(pending),
+    )
+
+
+@app.on_message(filters.command(["cancel"]) & AUTH)
+async def cancel_cmd(_, message):
+    target = _arg(message).lstrip("#")
+    if target.lower() == "all":
+        dropped = tasks.manager.clear_queue()
+        stopped = tasks.manager.cancel_current()
+        await reply(message, ui.panel(
+            "CANCELLED",
+            [f"{ui.E['stop']} Running task: "
+             f"{'stopping now' if stopped else 'none'}",
+             f"{ui.E['queue']} Dropped <b>{dropped}</b> queued task(s)"],
+            ui.E["stop"]))
+        return
+
+    if not target:
+        if tasks.manager.cancel_current():
+            await reply(message, ui.panel(
+                "CANCELLING",
+                [f"{ui.E['stop']} The running task will stop shortly.",
+                 f"{ui.E['info']} Use <code>/cancel all</code> to clear the queue too."],
+                ui.E["stop"]))
+        else:
+            await reply(message, ui.panel(
+                "NOTHING RUNNING", [f"{ui.E['info']} The queue is empty."], ui.E["info"]))
+        return
+
+    if tasks.manager.cancel(target):
+        await reply(message, ui.panel(
+            "CANCELLING",
+            [f"{ui.E['stop']} Task <code>#{ui.esc(target)}</code> cancelled."],
+            ui.E["stop"]))
+    else:
+        await reply(message, ui.panel(
+            "NOT FOUND", [f"{ui.E['warn']} No task <code>#{ui.esc(target)}</code>."],
+            ui.E["warn"]))
+
+
+# ----------------------------------------------------------------------
+# Destinations
+# ----------------------------------------------------------------------
+def _chats_view(page=0):
+    chats = [dict(c) for c in db.get_all_chats()]
+    pages = max(1, (len(chats) + CHATS_PAGE - 1) // CHATS_PAGE)
+    page = max(0, min(page, pages - 1))
+    slice_ = chats[page * CHATS_PAGE:(page + 1) * CHATS_PAGE]
+    return (
+        ui.chats_panel(slice_, page, pages, len(chats)),
+        keyboards.chats_controls(slice_, page, pages),
+    )
+
+
+@app.on_message(filters.command(["chats"]) & AUTH)
+async def chats_cmd(_, message):
+    text, kb = _chats_view(0)
+    await reply(message, text, kb)
+
+
+@app.on_message(filters.command(["addchat"]) & AUTH)
+async def addchat_cmd(client, message):
+    arg = _arg(message)
+    if not arg:
+        await reply(message, ui.panel("USAGE", [
+            f"{ui.E['arrow']} <code>/addchat &lt;chat_id&gt;</code>",
+            "",
+            "For chats auto-tracking missed. I must already be a member.",
+        ], ui.E["chat"]))
         return
     try:
-        chat_id = int(message.command[1])
+        chat_id = int(arg.split()[0])
     except ValueError:
-        await message.reply_text("chat_id must be a number.")
+        await reply(message, ui.panel("BAD ID", [
+            f"{ui.E['warn']} chat_id must be a number."], ui.E["warn"]))
+        return
+    try:
+        chat = await client.get_chat(chat_id)
+        db.add_or_update_chat(chat.id, chat.title, str(chat.type).split(".")[-1].lower())
+        await reply(message, ui.panel("CHAT ADDED", [
+            ui.kv("Title", chat.title, ui.E["chat"]),
+            ui.kv("Id", chat.id, ui.E["key"]),
+        ], ui.E["ok"]))
+    except Exception as e:
+        await reply(message, ui.panel("FAILED", [
+            f"{ui.E['fail']} <code>{ui.esc(e)}</code>",
+            "",
+            "Make sure I'm a member (admin in channels) first.",
+        ], ui.E["warn"]))
+
+
+@app.on_message(filters.command(["remove"]) & AUTH)
+async def remove_cmd(_, message):
+    arg = _arg(message)
+    if not arg:
+        await reply(message, ui.panel("USAGE", [
+            f"{ui.E['arrow']} <code>/remove &lt;chat_id&gt;</code>",
+            "",
+            "Get the id from <code>/chats</code>. To pause a chat instead of "
+            "dropping it, tap it in <code>/chats</code>.",
+        ], ui.E["chat"]))
+        return
+    try:
+        chat_id = int(arg.split()[0])
+    except ValueError:
+        await reply(message, ui.panel("BAD ID", [
+            f"{ui.E['warn']} chat_id must be a number."], ui.E["warn"]))
         return
     db.deactivate_chat(chat_id)
-    await message.reply_text(f"Removed `{chat_id}` from dump list.")
+    await reply(message, ui.panel("CHAT REMOVED", [
+        f"{ui.E['ok']} <code>{chat_id}</code> is off the dump list."], ui.E["ok"]))
 
 
-@app.on_message(filters.command("topic") & OWNER)
+@app.on_message(filters.command(["topic"]) & AUTH)
 async def topic_cmd(_, message):
-    if len(message.command) < 3:
-        await message.reply_text(
-            "Usage: `/topic <chat_id> <topic_id>`\n"
-            "Set topic to `0` to clear it.\n\n"
-            "To find the topic ID: open the topic in Telegram Web, "
-            "the URL ends with `/123` — that number is the topic ID."
-        )
+    parts = _arg(message).split()
+    if len(parts) != 2:
+        await reply(message, ui.panel("USAGE", [
+            f"{ui.E['arrow']} <code>/topic &lt;chat_id&gt; &lt;topic_id&gt;</code>",
+            f"{ui.E['arrow']} <code>/topic &lt;chat_id&gt; 0</code> (or "
+            f"<code>off</code>) to clear",
+            "",
+            "To find the topic id: open the topic in Telegram Web — the URL "
+            "ends with <code>/123</code>, and that number is the topic id.",
+        ], ui.E["chat"]))
+        return
+    chat_id, thread = parts
+    if db.get_chat(chat_id) is None:
+        await reply(message, ui.panel("UNKNOWN CHAT", [
+            f"{ui.E['warn']} <code>{ui.esc(chat_id)}</code> isn't tracked. "
+            f"See <code>/chats</code>."], ui.E["warn"]))
         return
     try:
-        chat_id = int(message.command[1])
-        topic_id = int(message.command[2])
+        value = None if thread.lower() in ("off", "none", "0") else int(thread)
     except ValueError:
-        await message.reply_text("Both chat_id and topic_id must be numbers.")
+        await reply(message, ui.panel("BAD ID", [
+            f"{ui.E['warn']} topic_id must be a number, or <code>0</code>/"
+            f"<code>off</code> to clear."], ui.E["warn"]))
         return
-    db.set_chat_thread(chat_id, topic_id if topic_id != 0 else None)
-    if topic_id:
-        await message.reply_text(f"Set topic `{topic_id}` for chat `{chat_id}`.")
-    else:
-        await message.reply_text(f"Cleared topic for chat `{chat_id}`.")
+    db.set_chat_thread(chat_id, value)
+    await reply(message, ui.panel("TOPIC UPDATED", [
+        ui.kv("Chat", chat_id, ui.E["chat"]),
+        ui.kv("Topic", value if value else "cleared", ui.E["arrow"]),
+    ], ui.E["ok"]))
 
 
-@app.on_message(filters.command("status") & OWNER)
-async def status_cmd(_, message):
-    used, total, free = _disk_usage()
-    disk_line = f"Disk: {used} / {total} ({free} free)"
+# ----------------------------------------------------------------------
+# Settings
+# ----------------------------------------------------------------------
+@app.on_message(filters.command(["settings"]) & AUTH)
+async def settings_cmd(_, message):
+    s = db.get_settings()
+    await reply(message, ui.settings_panel(s), keyboards.settings_controls(s))
 
-    if not _busy.locked():
-        await message.reply_text(f"No job running.\n{disk_line}")
+
+@app.on_message(filters.command(["prefix", "suffix"]) & AUTH)
+async def caption_cmd(_, message):
+    key = "caption_prefix" if message.command[0] == "prefix" else "caption_suffix"
+    value = _arg(message)
+    if value.lower() in ("off", "clear", "none"):
+        value = ""
+    db.set_setting(key, value)
+    s = db.get_settings()
+    await reply(message, ui.settings_panel(s), keyboards.settings_controls(s))
+
+
+@app.on_message(filters.command(["setthumb"]) & AUTH)
+async def setthumb_cmd(client, message):
+    target = message.reply_to_message
+    if not target or not (target.photo or target.document):
+        await reply(message, ui.panel("USAGE", [
+            f"{ui.E['arrow']} Reply to a photo with <code>/setthumb</code>."], "🖼"))
         return
+    await client.download_media(target, file_name=config.THUMB_PATH)
+    db.set_setting("use_thumb", 1)
+    await reply(message, ui.panel("THUMBNAIL SAVED", [
+        f"{ui.E['ok']} It will be attached to future uploads.",
+        f"{ui.E['info']} Remove it with <code>/delthumb</code>."], "🖼"))
 
-    info = _current_job_info
-    if not info:
-        await message.reply_text(f"Job running (no details yet).\n{disk_line}")
-        return
 
-    await message.reply_text(
-        f"**Job** `{info.get('job_id', '?')}`\n"
-        f"Progress: {info.get('current', '?')}/{info.get('total', '?')}\n"
-        f"Current: `{info.get('file', '?')}`\n"
-        f"{disk_line}"
+@app.on_message(filters.command(["delthumb"]) & AUTH)
+async def delthumb_cmd(_, message):
+    existed = os.path.exists(config.THUMB_PATH)
+    if existed:
+        os.remove(config.THUMB_PATH)
+    db.set_setting("use_thumb", 0)
+    await reply(message, ui.panel(
+        "THUMBNAIL", [f"{ui.E['ok']} Cleared." if existed
+                      else f"{ui.E['info']} There wasn't one."], "🖼"))
+
+
+# ----------------------------------------------------------------------
+# Diagnostics
+# ----------------------------------------------------------------------
+@app.on_message(filters.command(["stats"]) & AUTH)
+async def stats_cmd(_, message):
+    await reply(
+        message,
+        ui.stats_panel(db.get_stats(), utils.sysinfo(), time.time() - START_TIME, VERSION),
+        keyboards.back_home(),
     )
 
 
-@app.on_message(filters.command("disk") & OWNER)
-async def disk_cmd(_, message):
-    used, total, free = _disk_usage()
-    dl_size = "0 B"
-    try:
-        dl_total = sum(
-            os.path.getsize(os.path.join(r, f))
-            for r, _, files in os.walk(config.DOWNLOAD_DIR)
-            for f in files
-        )
-        dl_size = utils.human(dl_total)
-    except Exception:
-        pass
-    await message.reply_text(
-        f"**Disk usage:**\n"
-        f"System: {used} / {total} ({free} free)\n"
-        f"Downloads folder: {dl_size}"
-    )
+@app.on_message(filters.command(["sys", "disk"]) & AUTH)
+async def sys_cmd(_, message):
+    info = utils.sysinfo()
+    rows = ui.sysinfo_rows(info) or [f"{ui.E['info']} No metrics available."]
+    rows += [
+        ui.RULE,
+        ui.kv("Free disk", ui.human(utils.free_space()), ui.E["disk"]),
+        ui.kv("Downloads folder", ui.human(utils.downloads_size()), ui.E["box"]),
+        ui.kv("Uptime", ui.human_time(time.time() - START_TIME), ui.E["clock"]),
+    ]
+    await reply(message, ui.panel("SYSTEM", rows, ui.E["cpu"]), keyboards.back_home())
 
 
-@app.on_message(filters.command("cleanup") & OWNER)
+@app.on_message(filters.command(["cleanup"]) & AUTH)
 async def cleanup_cmd(_, message):
-    if _busy.locked():
-        await message.reply_text("A job is running — can't clean up now.")
+    if tasks.manager.current is not None:
+        await reply(message, ui.panel("BUSY", [
+            f"{ui.E['warn']} A task is running — cancel it before cleaning."],
+            ui.E["warn"]))
         return
-    try:
-        freed = 0
-        for r, _, files in os.walk(config.DOWNLOAD_DIR):
-            for f in files:
-                p = os.path.join(r, f)
-                freed += os.path.getsize(p)
-                os.remove(p)
-        # Also remove empty subdirectories
-        for r, dirs, _ in os.walk(config.DOWNLOAD_DIR, topdown=False):
-            for d in dirs:
-                try:
-                    os.rmdir(os.path.join(r, d))
-                except OSError:
-                    pass
-        await message.reply_text(f"Cleaned up {utils.human(freed)}.")
-    except Exception as e:
-        await message.reply_text(f"Cleanup failed: {e}")
+    freed = utils.cleanup_downloads()
+    await reply(message, ui.panel("CLEANED", [
+        ui.kv("Reclaimed", ui.human(freed), ui.E["disk"]),
+        ui.kv("Free now", ui.human(utils.free_space()), ui.E["disk"]),
+    ], ui.E["ok"]))
 
 
-@app.on_message(filters.command("probe") & OWNER)
-async def probe_cmd(_, message):
-    if len(message.command) < 2:
-        await message.reply_text("Usage: `/probe <mega folder url>`")
-        return
-    link = message.command[1]
-    msg = await message.reply_text("Running mega-ls...")
-    try:
-        await mega_client.login()
-        raw = await mega_client.raw_ls(link)
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
-        return
-    raw = raw or "(empty)"
-    await msg.edit_text("Raw listing (first 3500 chars):\n```\n" + raw[:3500] + "\n```")
+@app.on_message(filters.command(["ping"]) & AUTH)
+async def ping_cmd(_, message):
+    t0 = time.time()
+    sent = await reply(message, f"{ui.E['ping']} Pinging…")
+    delta = (time.time() - t0) * 1000
+    await edit(sent, ui.panel("PONG", [
+        ui.kv("Round trip", f"{delta:.0f} ms", ui.E["speed"]),
+        ui.kv("Uptime", ui.human_time(time.time() - START_TIME), ui.E["clock"]),
+        ui.kv("Queue", f"{len(tasks.manager.pending)} waiting", ui.E["queue"]),
+    ], ui.E["ping"]))
 
 
-@app.on_message(filters.command("cancel") & OWNER)
-async def cancel_cmd(_, message):
-    if _busy.locked():
-        _cancel.set()
-        await message.reply_text("Will stop after the current file finishes.")
-    else:
-        await message.reply_text("Nothing is running.")
-
-
-@app.on_message(filters.command("leech") & OWNER)
-async def leech_cmd(_, message):
-    if len(message.command) < 2:
-        await message.reply_text("Usage: `/leech <mega folder url>`")
-        return
-    if _busy.locked():
-        await message.reply_text("A job is already running. Use /cancel first.")
-        return
-    link = message.command[1]
-    status = await message.reply_text("Starting...")
-    async with _busy:
-        await run_leech(link, status, message.from_user.id)
-
-
-@app.on_message(filters.command("id"))
+@app.on_message(filters.command(["id"]))
 async def id_cmd(_, message):
+    """Public on purpose: it's how someone finds the id to ask for access."""
+    rows = [
+        ui.kv("Chat id", message.chat.id, ui.E["chat"]),
+        ui.kv("Chat type", str(message.chat.type).split(".")[-1].lower(), ui.E["info"]),
+    ]
     if message.from_user:
-        await message.reply_text(f"Your user ID: `{message.from_user.id}`")
+        rows.append(ui.kv("Your id", message.from_user.id, ui.E["user"]))
+    if message.message_thread_id:
+        rows.append(ui.kv("Topic id", message.message_thread_id, ui.E["arrow"]))
+    if message.reply_to_message and message.reply_to_message.from_user:
+        rows.append(ui.kv("Replied user id",
+                          message.reply_to_message.from_user.id, ui.E["user"]))
+    await reply(message, ui.panel("IDENTIFIERS", rows, ui.E["key"]))
+
+
+@app.on_message(filters.command(["log"]) & AUTH)
+async def log_cmd(client, message):
+    if not os.path.exists(config.LOG_PATH):
+        await reply(message, ui.panel("NO LOG YET",
+                                      [f"{ui.E['info']} Nothing has been written."],
+                                      ui.E["log"]))
+        return
+    await client.send_document(
+        message.chat.id, config.LOG_PATH,
+        caption=f"{ui.E['log']} <code>bot.log</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@app.on_message(filters.command(["users"]) & AUTH)
+async def users_cmd(_, message):
+    args = _arg(message).split()
+    is_owner = _is_owner(message.from_user.id)
+
+    if args and not is_owner:
+        await reply(message, ui.panel("OWNER ONLY", [
+            f"{ui.E['key']} Only an owner can change the user list."], ui.E["warn"]))
+        return
+
+    if args and args[0] in ("add", "del", "remove") and len(args) > 1:
+        try:
+            uid = int(args[1])
+        except ValueError:
+            await reply(message, ui.panel("BAD ID", [
+                f"{ui.E['warn']} <code>{ui.esc(args[1])}</code> isn't a numeric id."],
+                ui.E["warn"]))
+            return
+        if args[0] == "add":
+            db.add_user(uid, message.from_user.id)
+            note = f"{ui.E['ok']} <code>{uid}</code> can now use the bot."
+        else:
+            note = (f"{ui.E['ok']} <code>{uid}</code> removed."
+                    if db.remove_user(uid)
+                    else f"{ui.E['info']} <code>{uid}</code> wasn't on the list.")
+        await reply(message, ui.panel("USERS", [note], ui.E["user"]))
+        return
+
+    rows = [ui.kv("Owner", config.OWNER_ID, ui.E["key"])]
+    for uid in sorted(config.OWNER_IDS - {config.OWNER_ID}):
+        rows.append(ui.kv("Owner (EXTRA_OWNERS)", uid, ui.E["key"]))
+    for uid in sorted(config.SUDO_USERS):
+        rows.append(ui.kv("Sudo (env)", uid, ui.E["user"]))
+    for row in db.get_users():
+        rows.append(ui.kv("Sudo", row["user_id"], ui.E["user"]))
+    if is_owner:
+        rows += [ui.RULE,
+                 f"{ui.E['arrow']} <code>/users add &lt;id&gt;</code>",
+                 f"{ui.E['arrow']} <code>/users del &lt;id&gt;</code>"]
+    await reply(message, ui.panel("AUTHORIZED USERS", rows, ui.E["user"]))
+
+
+@app.on_message(filters.command(["restart"]) & AUTH)
+async def restart_cmd(_, message):
+    if not _is_owner(message.from_user.id):
+        await reply(message, ui.panel("OWNER ONLY", [
+            f"{ui.E['key']} Only an owner can restart the bot."], ui.E["warn"]))
+        return
+    if tasks.manager.current is not None:
+        await reply(
+            message,
+            ui.panel("A TASK IS RUNNING", [
+                f"{ui.E['warn']} Task <code>#{tasks.manager.current.id}</code> is active.",
+                "It will resume from the next unfinished file after the restart.",
+            ], ui.E["warn"]),
+            keyboards.confirm("restart", label="Restart anyway"),
+        )
+        return
+    await _do_restart(message)
+
+
+async def _do_restart(message):
+    sent = await reply(message, ui.panel(
+        "RESTARTING", [f"{ui.E['restart']} Back in a moment…"], ui.E["restart"]))
+    with open(RESTART_FLAG, "w") as fh:
+        fh.write(f"{sent.chat.id}:{sent.id}")
+    await app.stop()
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+
+
+# ----------------------------------------------------------------------
+# Callback router — `<namespace>:<action>[:args]`, see keyboards.py
+# ----------------------------------------------------------------------
+@app.on_callback_query()
+async def on_callback(client, query):
+    if not _is_authorized(query.from_user.id):
+        await query.answer("This bot is private.", show_alert=True)
+        return
+
+    ns, action, args = keyboards.parse(query.data)
+    try:
+        handler = {
+            "nav": _cb_nav, "help": _cb_help, "task": _cb_task,
+            "chats": _cb_chats, "set": _cb_settings, "ls": _cb_listing,
+            "ok": _cb_confirm,
+        }.get(ns)
+        if handler is None:
+            await query.answer()
+            return
+        await handler(client, query, action, args)
+    except MessageNotModified:
+        await query.answer()
+    except Exception as e:
+        log.exception("callback %s failed", query.data)
+        await query.answer(f"Failed: {e}"[:180], show_alert=True)
+
+
+async def _cb_nav(_, query, action, args):
+    if action == "noop":
+        await query.answer()
+        return
+    if action == "close":
+        await query.answer("Dismissed")
+        await query.message.delete()
+        return
+    if action == "home":
+        chats = len(db.get_active_chats())
+        name = query.from_user.first_name
+        await edit(query.message, ui.welcome(name, config.BRAND, chats, VERSION),
+                   keyboards.main_menu(tasks.manager.current is not None))
+    elif action == "status":
+        text, kb = _status_view()
+        await edit(query.message, text, kb)
+    elif action == "queue":
+        pending = list(tasks.manager.pending)
+        await edit(query.message, ui.queue_panel(tasks.manager.current, pending),
+                   keyboards.queue_controls(pending))
+    elif action == "stats":
+        await edit(
+            query.message,
+            ui.stats_panel(db.get_stats(), utils.sysinfo(),
+                           time.time() - START_TIME, VERSION),
+            keyboards.back_home(),
+        )
+    await query.answer()
+
+
+async def _cb_help(_, query, action, args):
+    page = args[0] if args else "main"
+    await edit(query.message, ui.help_panel(page), keyboards.help_menu(page))
+    await query.answer()
+
+
+async def _cb_task(_, query, action, args):
+    if action == "refresh":
+        task = tasks.manager.get(args[0]) if args else None
+        if task is None:
+            await query.answer("That task is gone.", show_alert=True)
+            return
+        await edit(query.message, ui.task_panel(task, db.get_settings()),
+                   keyboards.task_controls(task.id, task.state))
+        await query.answer("Refreshed")
+    elif action == "cancel":
+        ok = tasks.manager.cancel(args[0]) if args else False
+        await query.answer("Cancelling…" if ok else "Task not found",
+                           show_alert=not ok)
+    elif action == "cancelcur":
+        ok = tasks.manager.cancel_current()
+        await query.answer("Cancelling…" if ok else "Nothing is running",
+                           show_alert=not ok)
+    elif action == "clearq":
+        dropped = tasks.manager.clear_queue()
+        pending = list(tasks.manager.pending)
+        await edit(query.message, ui.queue_panel(tasks.manager.current, pending),
+                   keyboards.queue_controls(pending))
+        await query.answer(f"Dropped {dropped} task(s)")
+
+
+async def _cb_chats(client, query, action, args):
+    page = int(args[-1]) if args else 0
+    if action == "toggle":
+        chat_id = int(args[0])
+        enabled = db.toggle_chat(chat_id)
+        await query.answer("Enabled" if enabled else "Paused")
+    elif action == "sync":
+        await _sync_chat_titles(client)
+        await query.answer("Titles refreshed")
+    else:
+        await query.answer()
+    text, kb = _chats_view(page)
+    await edit(query.message, text, kb)
+
+
+async def _sync_chat_titles(client):
+    """Re-read titles for tracked chats, and drop the ones we've lost access to."""
+    for row in db.get_all_chats():
+        try:
+            chat = await client.get_chat(row["chat_id"])
+            if chat.title and chat.title != row["title"]:
+                db.set_chat_title(row["chat_id"], chat.title)
+        except Exception:
+            db.deactivate_chat(row["chat_id"])
+
+
+async def _cb_settings(_, query, action, args):
+    if action == "toggle":
+        key = args[0]
+        s = db.get_settings()
+        db.set_setting(key, 0 if s.get(key) else 1)
+        await query.answer("Updated")
+    elif action == "cycle":
+        key = args[0]
+        s = db.get_settings()
+        db.set_setting(key, keyboards.next_value(key, s.get(key)))
+        await query.answer("Updated")
+    elif action == "reset":
+        db.reset_settings()
+        await query.answer("Defaults restored")
+    else:
+        await query.answer()
+    s = db.get_settings()
+    await edit(query.message, ui.settings_panel(s), keyboards.settings_controls(s))
+
+
+async def _cb_listing(_, query, action, args):
+    token = args[0]
+    preview = _previews.get(token)
+    if preview is None:
+        await query.answer("That preview expired — run /list again.", show_alert=True)
+        return
+    if action == "page":
+        page = int(args[1])
+        await edit(query.message, _render_preview(token, page), _preview_kb(token, page))
+        await query.answer()
+    elif action == "start":
+        task = tasks.Task(preview["url"], query.from_user.id, title=preview["title"])
+        settings = db.get_settings()
+        await edit(query.message, ui.task_panel(task, settings),
+                   keyboards.task_controls(task.id, task.state))
+        task.status_msg = query.message
+        tasks.manager.add(task)
+        await query.answer("Queued")
+
+
+async def _cb_confirm(_, query, action, args):
+    if action == "restart":
+        await query.answer("Restarting")
+        await _do_restart(query.message)
+    else:
+        await query.answer()
 
 
 # ----------------------------------------------------------------------
@@ -524,30 +927,75 @@ async def id_cmd(_, message):
 async def track_membership(_, update: ChatMemberUpdated):
     member = update.new_chat_member or update.old_chat_member
     if member is None or member.user is None or member.user.id != BOT_ID:
-        return
+        return  # this update is about someone else, not the bot
     chat = update.chat
     new = update.new_chat_member
     if new and new.status in ACTIVE_STATUSES:
-        db.add_or_update_chat(chat.id, chat.title, str(chat.type))
+        db.add_or_update_chat(chat.id, chat.title, str(chat.type).split(".")[-1].lower())
+        log.info("tracking chat %s (%s)", chat.id, chat.title)
+        await _announce(f"{ui.E['ok']} Now dumping to <b>{ui.esc(chat.title)}</b>\n"
+                        f"<code>{chat.id}</code>")
     else:
         db.deactivate_chat(chat.id)
+        log.info("dropped chat %s (%s)", chat.id, chat.title)
+        await _announce(f"{ui.E['stop']} Removed from <b>{ui.esc(chat.title)}</b>\n"
+                        f"<code>{chat.id}</code>")
+
+
+async def _announce(text):
+    try:
+        await app.send_message(config.OWNER_ID, text, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------------
 # Startup
 # ----------------------------------------------------------------------
 async def _resume_jobs():
+    """Re-queue anything that was mid-flight when the process last died."""
     for job in db.get_running_jobs():
+        task = tasks.Task(
+            job["mega_url"], job["requested_by"],
+            title=job["title"], job_id=job["job_id"],
+        )
         try:
-            msg = await app.send_message(
-                config.OWNER_ID, f"Resuming interrupted job for {job['mega_url']}"
+            task.status_msg = await app.send_message(
+                job["requested_by"],
+                ui.panel("RESUMING", [
+                    f"{ui.E['restart']} Task <code>#{task.id}</code> picked up where "
+                    f"it left off.",
+                    ui.kv("Link", ui.trunc(job["mega_url"], 40), ui.E["link"]),
+                ], ui.E["restart"]),
+                parse_mode=ParseMode.HTML,
             )
         except Exception:
-            continue
-        async with _busy:
-            await run_leech(
-                job["mega_url"], msg, job["requested_by"], job_id=job["job_id"]
-            )
+            log.warning("could not message %s about resumed job", job["requested_by"])
+        tasks.manager.add(task)
+        log.info("resumed job %s", task.id)
+
+
+async def _announce_restart():
+    if not os.path.exists(RESTART_FLAG):
+        return
+    try:
+        with open(RESTART_FLAG) as fh:
+            chat_id, msg_id = fh.read().strip().split(":")
+        await app.edit_message_text(
+            int(chat_id), int(msg_id),
+            ui.panel("RESTARTED", [
+                f"{ui.E['ok']} Back online.",
+                ui.kv("Version", VERSION, ui.E["info"]),
+            ], ui.E["restart"]),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+    finally:
+        try:
+            os.remove(RESTART_FLAG)
+        except OSError:
+            pass
 
 
 async def main():
@@ -558,9 +1006,18 @@ async def main():
     await app.start()
     me = await app.get_me()
     BOT_ID = me.id
-    print(f"Bot @{me.username} started.")
+    tasks.manager.bind(app)
+    tasks.manager.start()
 
+    try:
+        await app.set_bot_commands([BotCommand(c, d) for c, d in COMMANDS])
+    except Exception:
+        log.warning("could not publish the command menu")
+
+    log.info("Bot @%s started (v%s).", me.username, VERSION)
+    await _announce_restart()
     await _resume_jobs()
+
     await idle()
     await app.stop()
 
