@@ -186,7 +186,7 @@ async def reply(message, text, kb=None):
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
-        disable_web_page_preview=True,
+        link_preview_options=keyboards.NO_PREVIEW,
         quote=False,
     )
 
@@ -197,7 +197,7 @@ async def edit(message, text, kb=None):
             text,
             parse_mode=ParseMode.HTML,
             reply_markup=kb,
-            disable_web_page_preview=True,
+            link_preview_options=keyboards.NO_PREVIEW,
         )
     except MessageNotModified:
         return message

@@ -10,10 +10,17 @@ a button here plus a branch there is the whole story for new UI.
 """
 from pyrogram.types import InlineKeyboardButton as Btn
 from pyrogram.types import InlineKeyboardMarkup as Markup
+from pyrogram.types import LinkPreviewOptions
 
 import ui
 
 CB_SEP = ":"
+
+# Kurigram deprecated `disable_web_page_preview` in favour of this object and
+# logs a warning for every call still using the old name — that's once per
+# dashboard redraw, which buries the real log lines. Shared from here so bot.py
+# and tasks.py send the same thing.
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 
 def cb(ns, action, *args) -> str:
