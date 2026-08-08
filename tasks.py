@@ -230,7 +230,7 @@ class Manager:
                 text,
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboards.task_controls(task.id, task.state),
-                disable_web_page_preview=True,
+                link_preview_options=keyboards.NO_PREVIEW,
             )
         except MessageNotModified:
             pass
